@@ -1,0 +1,15 @@
+# all pth, onnx, npz, txt file ignore
+*.pth
+*.onnx
+*.npz
+*.txt
+
+
+# ignore __pycache__
+__pycache__/
+
+# ignore .csv
+*.csv
+
+# ignore .png
+*.png
