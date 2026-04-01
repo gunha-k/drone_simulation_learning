@@ -52,7 +52,12 @@ position 있고 lstm 2 layer 학습 : SimulLearn_LSTM_2026-03-03_13:25:20.pth
 전부 정규화하고 가중치 균일 : SimulLearn_LSTM_2026-03-23_11-55-54.pth
 --> 정규화 코드 적용 안됨
 
+전부 정규화함 : SimulLearn_LSTM_Normalized_2026-03-24_14-55-16.pth -> 학습 오류
+SimulLearn_LSTM_Normalized_2026-03-26_13-33-10.pth -> 학습 최적 ealry stopping
 
+SimulLearn_Transformer_Normalized_2026-03-26_16-03-14.pth -> transformer 도입
+
+SimulLearn_Transformer_Normalized_2026-03-31_11-09-42.pth -> 모델 크기 증가 및 early stopping 완화, learning rate 조절
 
 ## Test
 

@@ -3,13 +3,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-SEQUENCE_LENGTH = 20
+SEQUENCE_LENGTH = 128
 
-date = "03-23"
+date = "03-31"
 
 BASE_DIR = Path(__file__).resolve().parent
 
-original = pd.read_csv(BASE_DIR / "small_log.csv", header=None)
+original = pd.read_csv(BASE_DIR / "small_log_mission.csv", header=None)
 predicted = pd.read_csv(BASE_DIR / date / "predictions.csv", header=None)
 
 predicted.iloc[0, 0:3] += original.iloc[SEQUENCE_LENGTH - 1, 0:3]
@@ -26,7 +26,7 @@ ax.legend()
 
 output_dir = BASE_DIR / date
 output_dir.mkdir(parents=True, exist_ok=True)
-output_path = output_dir / "path_predicted_2026_03_23.png"
+output_path = output_dir / "path_predicted_2026_03_31.png"
 plt.savefig(output_path)
 print(f"Saved plot to: {output_path}")
 plt.show()
