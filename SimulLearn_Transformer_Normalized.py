@@ -18,6 +18,9 @@ NUM_WORKERS = 12
 PREFETCH_FACTOR = 2
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 1e-4
+MIN_LEARNING_RATE = 1e-6
+WEIGHT_DECAY = 1e-4
+WARMUP_EPOCHS = 5
 EARLY_STOPPING_PATIENCE = 10
 EARLY_STOPPING_MIN_DELTA = 1e-5
 D_MODEL = 128
@@ -85,6 +88,13 @@ def load_normalizers(path: Path) -> Tuple[StandardNormalizer, StandardNormalizer
 class SimulLearn_Transformer(nn.Module):
     def __init__(self):
         super(SimulLearn_Transformer, self).__init__()
+        self.feature_mixer = nn.Sequential(
+            nn.LayerNorm(INPUT_SIZE),
+            nn.Linear(INPUT_SIZE, D_MODEL),
+            nn.GELU(),
+            nn.Dropout(DROPOUT),
+            nn.Linear(D_MODEL, INPUT_SIZE),
+        )
         self.input_projection = nn.Linear(INPUT_SIZE, D_MODEL)
         self.pos_embedding = nn.Embedding(SEQUENCE_LENGTH, D_MODEL)
         self.dropout = nn.Dropout(DROPOUT)
@@ -102,12 +112,14 @@ class SimulLearn_Transformer(nn.Module):
             nn.LayerNorm(D_MODEL),
             nn.Linear(D_MODEL, OUTPUT_SIZE)
         )
+
     def forward(self, x):
-        B, T, _ = x.shape
+        _, T, _ = x.shape
         pos = torch.arange(T, device=x.device).unsqueeze(0)
+        x = x + self.feature_mixer(x)
         x = self.dropout(self.input_projection(x) + self.pos_embedding(pos))
         x = self.transformer(x)
-        x = x.mean(dim=1)
+        x = x[:, -1, :]
         return self.fc(x)
     
 
@@ -140,7 +152,7 @@ class CustomDroneDatasetNormalized(Dataset):
 
     def __getitem__(self, idx):
         x = self.inp[idx : idx + self.sequence_length]  # (seq, 17)
-        y = self.outp[idx + self.sequence_length]  # (13,)
+        y = self.outp[idx + self.sequence_length - 1]  # (13,)
 
         x_norm = self.inp_norm.transform(x)
         y_norm = self.out_norm.transform(y)
@@ -157,7 +169,7 @@ def fit_normalizers_from_training_split(data_file: Path) -> Tuple[StandardNormal
     train_size = int(0.8 * dataset_len)
 
     inp_train_rows = inp_all[: SEQUENCE_LENGTH + train_size]
-    out_train_rows = out_all[SEQUENCE_LENGTH : SEQUENCE_LENGTH + train_size]
+    out_train_rows = out_all[SEQUENCE_LENGTH - 1 : SEQUENCE_LENGTH - 1 + train_size]
 
     inp_norm = StandardNormalizer()
     out_norm = StandardNormalizer()
@@ -231,9 +243,26 @@ def main_train() -> None:
     )
 
     model = SimulLearn_Transformer().to(device)
-    criterion = nn.HuberLoss(delta=0.5)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    warmup_epochs = min(WARMUP_EPOCHS, max(NUM_EPOCHS - 1, 1))
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[
+            torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=0.1,
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            ),
+            torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(NUM_EPOCHS - warmup_epochs, 1),
+                eta_min=MIN_LEARNING_RATE,
+            ),
+        ],
+        milestones=[warmup_epochs],
+    )
     best_val_loss = float("inf")
     best_model_state = None
     epochs_without_improvement = 0
@@ -266,10 +295,10 @@ def main_train() -> None:
                     val_loss += loss.item()
 
             avg_val_loss = val_loss / len(val_dataloader)
-            scheduler.step(avg_val_loss)
+            scheduler.step()
             current_lr = optimizer.param_groups[0]["lr"]
             line = (
-                f"Epoch [{epoch + 1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.8f} | Val Loss: {avg_val_loss:.8f} | Learning Rate: {current_lr:.4f}"
+                f"Epoch [{epoch + 1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.8f} | Val Loss: {avg_val_loss:.8f} | Learning Rate: {current_lr:.6f}"
             )
             print(line)
             f.write(line + "\n")
