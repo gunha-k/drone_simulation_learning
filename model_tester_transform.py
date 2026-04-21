@@ -83,10 +83,10 @@ def main() -> None:
     # Usage:
     #   python3 model_tester.py [MODEL_PATH] [NORMALIZERS_PATH] [OUT_SUBDIR]
     # If omitted, uses latest Transformer model and matching normalizers.
-    model_path = "SimulLearn_Transformer_Normalized_2026-03-31_11-09-42.pth"
-    normalizers_path = "normalizers_2026-03-31_11-09-42.npz"
+    model_path = "SimulLearn_Transformer_Normalized_2026-04-01_15-29-09.pth"
+    normalizers_path = "normalizers_2026-04-01_15-29-09.npz"
 
-    out_subdir = "03-31"
+    out_subdir = "04-01"
 
     print(f"Model: {model_path}")
     print(f"Normalizers: {normalizers_path}")

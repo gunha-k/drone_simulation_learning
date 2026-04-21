@@ -5,7 +5,7 @@ import pandas as pd
 
 SEQUENCE_LENGTH = 128
 
-date = "03-31"
+date = "04-01"
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -26,7 +26,7 @@ ax.legend()
 
 output_dir = BASE_DIR / date
 output_dir.mkdir(parents=True, exist_ok=True)
-output_path = output_dir / "path_predicted_2026_03_31.png"
+output_path = output_dir / "path_predicted_2026_04_01.png"
 plt.savefig(output_path)
 print(f"Saved plot to: {output_path}")
 plt.show()

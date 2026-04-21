@@ -11,22 +11,21 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 INPUT_SIZE = 17
 OUTPUT_SIZE = 13
-NUM_EPOCHS = 100
+NUM_EPOCHS = 50
 BATCH_SIZE = 64
-NUM_LAYERS = 4
 NUM_WORKERS = 12
 PREFETCH_FACTOR = 2
 SEQUENCE_LENGTH = 128
-LEARNING_RATE = 1e-4
-MIN_LEARNING_RATE = 1e-6
+PRED_LENGTH = 1
+LEARNING_RATE = 1e-3
+MIN_LEARNING_RATE = 1e-5
 WEIGHT_DECAY = 1e-4
 WARMUP_EPOCHS = 5
 EARLY_STOPPING_PATIENCE = 10
 EARLY_STOPPING_MIN_DELTA = 1e-5
-D_MODEL = 64
-NHEAD = 8
-DROPOUT = 0.1
-PRED_LEN = 1
+MODEL_TYPE = "DLinear"  # "Linear", "NLinear", "DLinear"
+MOVING_AVG_KERNEL = 25
+INDIVIDUAL = False
 
 device = (
     "cuda"
@@ -86,42 +85,103 @@ def load_normalizers(path: Path) -> Tuple[StandardNormalizer, StandardNormalizer
     return inp_norm, out_norm
 
 
-class SimulLearn_Transformer(nn.Module):
-    def __init__(self):
-        super(SimulLearn_Transformer, self).__init__()
-        # iTransformer-style embedding:
-        # [B, T, N] -> [B, N, T] -> Linear(T -> D_MODEL) -> [B, N, D_MODEL]
-        self.variate_embedding = nn.Linear(SEQUENCE_LENGTH, D_MODEL)
-        self.dropout = nn.Dropout(DROPOUT)
-        encode_layer = nn.TransformerEncoderLayer(
-            d_model=D_MODEL,
-            nhead=NHEAD,
-            dim_feedforward=D_MODEL * 4,
-            dropout=DROPOUT,
-            batch_first=True,
-            norm_first=False,
-            activation="gelu",
-        )
-        self.transformer = nn.TransformerEncoder(
-            encode_layer,
-            num_layers=NUM_LAYERS,
-            norm=nn.LayerNorm(D_MODEL),
-        )
-        # Shared projection on each variate token, same style as official iTransformer.
-        self.projector = nn.Linear(D_MODEL, PRED_LEN, bias=True)
+class MovingAverage(nn.Module):
+    def __init__(self, kernel_size: int):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.avg = nn.AvgPool1d(kernel_size=kernel_size, stride=1, padding=0)
 
-    def forward(self, x):
-        _, T, _ = x.shape
-        if T != SEQUENCE_LENGTH:
-            raise ValueError(f"Expected sequence length {SEQUENCE_LENGTH}, got {T}")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pad = (self.kernel_size - 1) // 2
+        front = x[:, 0:1, :].repeat(1, pad, 1)
+        end = x[:, -1:, :].repeat(1, pad, 1)
+        x = torch.cat([front, x, end], dim=1)
+        x = self.avg(x.transpose(1, 2)).transpose(1, 2)
+        return x
 
-        # Invert dimensions so attention is over variates (tokens), not time steps.
-        x = x.permute(0, 2, 1)  # [B, N, T]
-        x = self.dropout(self.variate_embedding(x))  # [B, N, D_MODEL]
-        x = self.transformer(x)  # [B, N, D_MODEL]
-        x = self.projector(x).permute(0, 2, 1)  # [B, PRED_LEN, N]
-        return x[:, -1, :OUTPUT_SIZE]  # [B, 13]
-    
+
+class SeriesDecomposition(nn.Module):
+    def __init__(self, kernel_size: int):
+        super().__init__()
+        self.moving_avg = MovingAverage(kernel_size)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        trend = self.moving_avg(x)
+        seasonal = x - trend
+        return seasonal, trend
+
+
+class TemporalLinearBlock(nn.Module):
+    def __init__(self, seq_len: int, pred_len: int, channels: int, individual: bool):
+        super().__init__()
+        self.individual = individual
+        self.pred_len = pred_len
+        if individual:
+            self.layers = nn.ModuleList([nn.Linear(seq_len, pred_len) for _ in range(channels)])
+        else:
+            self.layer = nn.Linear(seq_len, pred_len)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.individual:
+            out = torch.zeros(x.size(0), x.size(1), self.pred_len, device=x.device, dtype=x.dtype)
+            for idx, layer in enumerate(self.layers):
+                out[:, idx, :] = layer(x[:, idx, :])
+            return out
+        return self.layer(x)
+
+
+class LTSFLinearModel(nn.Module):
+    def __init__(
+        self,
+        seq_len: int = SEQUENCE_LENGTH,
+        pred_len: int = PRED_LENGTH,
+        input_size: int = INPUT_SIZE,
+        output_size: int = OUTPUT_SIZE,
+        model_type: str = MODEL_TYPE,
+        moving_avg_kernel: int = MOVING_AVG_KERNEL,
+        individual: bool = INDIVIDUAL,
+    ):
+        super().__init__()
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.input_size = input_size
+        self.output_size = output_size
+        self.model_type = model_type
+
+        if model_type not in {"Linear", "NLinear", "DLinear"}:
+            raise ValueError(f"Unsupported model_type={model_type}")
+
+        if model_type == "DLinear":
+            self.decomposition = SeriesDecomposition(moving_avg_kernel)
+            self.linear_seasonal = TemporalLinearBlock(seq_len, pred_len, input_size, individual)
+            self.linear_trend = TemporalLinearBlock(seq_len, pred_len, input_size, individual)
+        else:
+            self.linear = TemporalLinearBlock(seq_len, pred_len, input_size, individual)
+
+        self.output_projection = nn.Linear(input_size * pred_len, output_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[1:] != (self.seq_len, self.input_size):
+            raise ValueError(
+                f"Expected input shape (*, {self.seq_len}, {self.input_size}), got {tuple(x.shape)}"
+            )
+
+        if self.model_type == "DLinear":
+            seasonal_init, trend_init = self.decomposition(x)
+            seasonal_init = seasonal_init.transpose(1, 2)
+            trend_init = trend_init.transpose(1, 2)
+            temporal_out = self.linear_seasonal(seasonal_init) + self.linear_trend(trend_init)
+        elif self.model_type == "NLinear":
+            last = x[:, -1:, :]
+            normalized = (x - last).transpose(1, 2)
+            temporal_out = self.linear(normalized).transpose(1, 2) + last
+            temporal_out = temporal_out.transpose(1, 2)
+        else:
+            temporal_out = self.linear(x.transpose(1, 2))
+
+        temporal_out = temporal_out.reshape(x.size(0), self.input_size * self.pred_len)
+        return self.output_projection(temporal_out)
+
 
 class CustomDroneDatasetNormalized(Dataset):
     def __init__(
@@ -134,8 +194,8 @@ class CustomDroneDatasetNormalized(Dataset):
         df = pd.read_csv(data_file, header=None)
         self.sequence_length = sequence_length
 
-        inp = df.iloc[:-1, :].values.astype(np.float32)  # (N-1, 17)
-        outp = df.iloc[1:, :-4].values.astype(np.float32)  # (N-1, 13)
+        inp = df.iloc[:-1, 1:].values.astype(np.float32)
+        outp = df.iloc[1:, 1:-4].values.astype(np.float32)
 
         if inp.shape[1] != INPUT_SIZE:
             raise ValueError(f"Expected {INPUT_SIZE} input features, got {inp.shape[1]}")
@@ -151,8 +211,8 @@ class CustomDroneDatasetNormalized(Dataset):
         return len(self.inp) - self.sequence_length
 
     def __getitem__(self, idx):
-        x = self.inp[idx : idx + self.sequence_length]  # (seq, 17)
-        y = self.outp[idx + self.sequence_length - 1]  # (13,)
+        x = self.inp[idx : idx + self.sequence_length]
+        y = self.outp[idx + self.sequence_length - 1]
 
         x_norm = self.inp_norm.transform(x)
         y_norm = self.out_norm.transform(y)
@@ -162,13 +222,13 @@ class CustomDroneDatasetNormalized(Dataset):
 
 def fit_normalizers_from_training_split(data_file: Path) -> Tuple[StandardNormalizer, StandardNormalizer, int]:
     df = pd.read_csv(data_file, header=None)
-    inp_all = df.iloc[:-1, :].values.astype(np.float32)
-    out_all = df.iloc[1:, :-4].values.astype(np.float32)
+    inp_all = df.iloc[:-1, 1:].values.astype(np.float32)
+    out_all = df.iloc[1:, 1:-4].values.astype(np.float32)
 
     dataset_len = len(inp_all) - SEQUENCE_LENGTH
     train_size = int(0.8 * dataset_len)
 
-    inp_train_rows = inp_all[: SEQUENCE_LENGTH + train_size - 1]
+    inp_train_rows = inp_all[: SEQUENCE_LENGTH + train_size]
     out_train_rows = out_all[SEQUENCE_LENGTH - 1 : SEQUENCE_LENGTH - 1 + train_size]
 
     inp_norm = StandardNormalizer()
@@ -200,7 +260,7 @@ def predict_one_step(
     out_norm: StandardNormalizer,
 ) -> np.ndarray:
     x_norm = normalize_input_sequence(raw_sequence, inp_norm)
-    x_t = torch.from_numpy(x_norm).unsqueeze(0).to(device)  # (1, seq, 17)
+    x_t = torch.from_numpy(x_norm).unsqueeze(0).to(device)
     with torch.no_grad():
         y_norm_t = model(x_t)[0]
     y_norm = y_norm_t.detach().cpu().numpy().astype(np.float32)
@@ -208,7 +268,7 @@ def predict_one_step(
 
 
 def main_train() -> None:
-    data_file = BASE_DIR / "all_diffed.csv"
+    data_file = BASE_DIR / "position_diffed.csv"
 
     inp_norm, out_norm, _ = fit_normalizers_from_training_split(data_file)
     normalizers_path = BASE_DIR / f"normalizers_{date}.npz"
@@ -242,7 +302,7 @@ def main_train() -> None:
         persistent_workers=True,
     )
 
-    model = SimulLearn_Transformer().to(device)
+    model = LTSFLinearModel().to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     warmup_epochs = min(WARMUP_EPOCHS, max(NUM_EPOCHS - 1, 1))
@@ -267,7 +327,7 @@ def main_train() -> None:
     best_model_state = None
     epochs_without_improvement = 0
 
-    log_path = BASE_DIR / f"SimulLearn_Transformer_Training_Log{date}.txt"
+    log_path = BASE_DIR / f"SimulLearn_{MODEL_TYPE}_Training_Log{date}.txt"
     with open(log_path, "w") as f:
         for epoch in range(NUM_EPOCHS):
             model.train()
@@ -298,7 +358,8 @@ def main_train() -> None:
             scheduler.step()
             current_lr = optimizer.param_groups[0]["lr"]
             line = (
-                f"Epoch [{epoch + 1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.8f} | Val Loss: {avg_val_loss:.8f} | Learning Rate: {current_lr:.6f}"
+                f"Epoch [{epoch + 1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.8f} | "
+                f"Val Loss: {avg_val_loss:.8f} | Learning Rate: {current_lr:.6f}"
             )
             print(line)
             f.write(line + "\n")
@@ -319,8 +380,8 @@ def main_train() -> None:
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
 
-    model_path = BASE_DIR / f"SimulLearn_Transformer_Normalized_{date}.pth"
-    torch.save(model.state_dict(), model_path)
+    model_path = BASE_DIR / f"SimulLearn_{MODEL_TYPE}_Normalized_{date}.pth"
+    torch.save(model, model_path)
     print(f"Model saved to {model_path}")
 
 

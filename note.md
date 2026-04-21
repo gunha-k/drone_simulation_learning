@@ -31,7 +31,7 @@ Simulation_LSTM.py는
 ## Dataset
 
 position difference(3), attitude(4, quaternion), velocity(3), angular velocity(3), motor value(3, normalized) 총 17개의 벡터로 구성
-sequence length 만큼의 이전 데이터를 input으로 다음 상태의 14개 벡터를 추론한다.(motor value 제외)
+sequence length 만큼의 이전 데이터를 input으로 다음 상태의 13개 벡터를 추론한다.(motor value 제외)
 
 ## Train
 
@@ -58,6 +58,11 @@ SimulLearn_LSTM_Normalized_2026-03-26_13-33-10.pth -> 학습 최적 ealry stoppi
 SimulLearn_Transformer_Normalized_2026-03-26_16-03-14.pth -> transformer 도입
 
 SimulLearn_Transformer_Normalized_2026-03-31_11-09-42.pth -> 모델 크기 증가 및 early stopping 완화, learning rate 조절
+
+SimulLearn_Transformer_Normalized_2026-04-01_15-29-09.pth -> mean pooling 대신 first token pooling
+
+SimulLearn_Transformer_Normalized_2026-04-02_11-30-43.pth -> itransformer
+
 
 ## Test
 
