@@ -63,6 +63,8 @@ SimulLearn_Transformer_Normalized_2026-04-01_15-29-09.pth -> mean pooling 대신
 
 SimulLearn_Transformer_Normalized_2026-04-02_11-30-43.pth -> itransformer
 
+SimulLearn_Transformer_Normalized_2026-04-23_15-58-58.pth -> iTransformer + long epoch
+
 
 ## Test
 

@@ -23,10 +23,11 @@ WEIGHT_DECAY = 1e-4
 WARMUP_EPOCHS = 5
 EARLY_STOPPING_PATIENCE = 10
 EARLY_STOPPING_MIN_DELTA = 1e-5
-D_MODEL = 64
+D_MODEL = 128
 NHEAD = 8
 DROPOUT = 0.1
 PRED_LEN = 1
+USE_AMP = True
 
 device = (
     "cuda"
@@ -36,6 +37,12 @@ device = (
     else "cpu"
 )
 print(f"Using {device} device")
+if device == "cuda":
+    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
 date = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 BASE_DIR = Path(__file__).resolve().parent
@@ -142,10 +149,9 @@ class CustomDroneDatasetNormalized(Dataset):
         if outp.shape[1] != OUTPUT_SIZE:
             raise ValueError(f"Expected {OUTPUT_SIZE} output features, got {outp.shape[1]}")
 
-        self.inp = inp
-        self.outp = outp
-        self.inp_norm = inp_norm
-        self.out_norm = out_norm
+        # Normalize once up front to avoid per-sample CPU bottlenecks in __getitem__.
+        self.inp = torch.from_numpy(inp_norm.transform(inp))
+        self.outp = torch.from_numpy(out_norm.transform(outp))
 
     def __len__(self):
         return len(self.inp) - self.sequence_length
@@ -153,11 +159,7 @@ class CustomDroneDatasetNormalized(Dataset):
     def __getitem__(self, idx):
         x = self.inp[idx : idx + self.sequence_length]  # (seq, 17)
         y = self.outp[idx + self.sequence_length - 1]  # (13,)
-
-        x_norm = self.inp_norm.transform(x)
-        y_norm = self.out_norm.transform(y)
-
-        return torch.from_numpy(x_norm), torch.from_numpy(y_norm)
+        return x, y
 
 
 def fit_normalizers_from_training_split(data_file: Path) -> Tuple[StandardNormalizer, StandardNormalizer, int]:
@@ -208,7 +210,7 @@ def predict_one_step(
 
 
 def main_train() -> None:
-    data_file = BASE_DIR / "all_diffed.csv"
+    data_file = BASE_DIR / "position_diffed_no_timestamp.csv" # position(3) + attitude(4) + linear_vel(3) + angular_vel(3) + motor_value(4) = 17
 
     inp_norm, out_norm, _ = fit_normalizers_from_training_split(data_file)
     normalizers_path = BASE_DIR / f"normalizers_{date}.npz"
@@ -225,26 +227,24 @@ def main_train() -> None:
     train_dataset = Subset(full_dataset, train_indices)
     val_dataset = Subset(full_dataset, val_indices)
 
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        prefetch_factor=PREFETCH_FACTOR,
-        persistent_workers=True,
-    )
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        prefetch_factor=PREFETCH_FACTOR,
-        persistent_workers=True,
-    )
+    use_cuda = device == "cuda"
+    dataloader_kwargs = {
+        "batch_size": BATCH_SIZE,
+        "num_workers": NUM_WORKERS,
+        "persistent_workers": NUM_WORKERS > 0,
+        "pin_memory": use_cuda,
+    }
+    if NUM_WORKERS > 0:
+        dataloader_kwargs["prefetch_factor"] = PREFETCH_FACTOR
+
+    train_dataloader = DataLoader(train_dataset, shuffle=True, **dataloader_kwargs)
+    val_dataloader = DataLoader(val_dataset, shuffle=False, **dataloader_kwargs)
 
     model = SimulLearn_Transformer().to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    use_amp = USE_AMP and use_cuda
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     warmup_epochs = min(WARMUP_EPOCHS, max(NUM_EPOCHS - 1, 1))
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
@@ -273,14 +273,24 @@ def main_train() -> None:
             model.train()
             running_loss = 0.0
             for inputs, targets in train_dataloader:
-                inputs, targets = inputs.to(device), targets.to(device)
+                inputs = inputs.to(device, non_blocking=use_cuda)
+                targets = targets.to(device, non_blocking=use_cuda)
 
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
                 running_loss += loss.item()
 
             avg_loss = running_loss / len(train_dataloader)
@@ -289,9 +299,11 @@ def main_train() -> None:
             val_loss = 0.0
             with torch.no_grad():
                 for inputs, targets in val_dataloader:
-                    inputs, targets = inputs.to(device), targets.to(device)
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
+                    inputs = inputs.to(device, non_blocking=use_cuda)
+                    targets = targets.to(device, non_blocking=use_cuda)
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                        outputs = model(inputs)
+                        loss = criterion(outputs, targets)
                     val_loss += loss.item()
 
             avg_val_loss = val_loss / len(val_dataloader)
