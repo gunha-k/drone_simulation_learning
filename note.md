@@ -65,7 +65,8 @@ SimulLearn_Transformer_Normalized_2026-04-02_11-30-43.pth -> itransformer
 
 SimulLearn_Transformer_Normalized_2026-04-23_15-58-58.pth -> iTransformer + long epoch
 
-
 ## Test
 
 같은 조건의 데이터셋이되, 비행 수가 적은 데이터를 활용하여 가공한 데이터가 small_log_diffed이다.
+
+model_tester_transform.py를 사용하면 small_log_diffed를 이용하여 현재 모델의 test를 진행할 수 있다.
